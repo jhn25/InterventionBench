@@ -1,0 +1,24 @@
+# Trajectories — full 3.3 GB bundle hosted separately (Zenodo/HF, TBD).
+# adaptability.json (the summary) is kept and tracked.
+results/appworld/
+results/webarena/
+
+# Python build/runtime
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+
+# IDE / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Local logs / caches
+logs/
+.cache/

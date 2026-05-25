@@ -1,0 +1,6 @@
+numpy>=1.24
+pandas>=2.0
+tqdm>=4.65
+openai>=1.30
+playwright>=1.40
+beautifulsoup4>=4.12
