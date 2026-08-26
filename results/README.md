@@ -30,4 +30,4 @@ Per-trajectory schema:
 }
 ```
 
-Run `python ../scripts/eval.py --results .` to recompute SR + Adaptability.
+The bundled trajectories are unchanged raw data; recompute their AppWorld Add verdicts with `python ../scripts/score_add_assertions.py --results appworld`, then run `python ../scripts/eval.py --results . --data ../data` to recompute SR + Adaptability.

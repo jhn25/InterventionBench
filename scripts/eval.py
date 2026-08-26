@@ -8,12 +8,14 @@ Computes, for each (model, domain) under results/:
   * Per-type Adaptability (Swap / Drop / Add / Cancel)
 
 Type-aware A->B success rule:
-  Add    -> a passes (relaxed >= 0.5) AND b passes
+  AppWorld Add -> both evaluators pass at the substantive-assertion level
+  WebArena Add -> a passes AND b passes
   Swap   -> b passes AND a does not pass
   Drop   -> b passes AND a does not pass
   Cancel -> metadata.cancel_pass (trajectory-based)
 
 Usage:
+  APPWORLD_ROOT=/path/to/appworld python scripts/score_add_assertions.py
   python scripts/eval.py --results results/
   python scripts/eval.py --results results/ --output adaptability.json
 """
@@ -25,10 +27,10 @@ import sys
 from collections import defaultdict
 from pathlib import Path
 
-# Pass thresholds.
-PASS = 0.999          # strict: a == 1.0 and b == 1.0
-ADD_RELAX = 0.5       # for Add: A passes when its answer assertion passes
-                      # (set ADD_RELAX = PASS to recover strict a && b).
+REPO_ROOT = Path(__file__).resolve().parents[1]
+
+# All scalar evaluator outcomes use the paper's threshold.
+PASS = 0.999
 
 # Wilson constants for 95% CI.
 Z = 1.959963984540054
@@ -53,7 +55,15 @@ def wilson_ci(k: int, n: int) -> tuple[float, float]:
     return (max(0.0, center - half), min(1.0, center + half))
 
 
-def type_aware_pass(iv_type: str | None, a_score, b_score, md: dict | None = None) -> bool:
+def type_aware_pass(
+    iv_type: str | None,
+    a_score,
+    b_score,
+    md: dict | None = None,
+    *,
+    domain: str,
+    appworld_add_pass: bool | None = None,
+) -> bool:
     """Type-aware A->B success rule. Returns True iff trajectory passes its type."""
     if iv_type is None:
         return False
@@ -69,8 +79,11 @@ def type_aware_pass(iv_type: str | None, a_score, b_score, md: dict | None = Non
     b_p = (b_score or 0) >= PASS if b_score is not None else False
 
     if 'Add' in iv_type:
-        a_relax = (a_score or 0) >= ADD_RELAX if a_score is not None else False
-        return a_relax and bool(b_p)
+        if domain == 'appworld':
+            if appworld_add_pass is None:
+                raise ValueError('missing AppWorld Add assertion-level verdict')
+            return appworld_add_pass
+        return bool(a_p) and bool(b_p)
     if 'Swap' in iv_type or 'Drop' in iv_type:
         return bool(b_p) and (a_p is False if a_p is not None else True)
     return bool(b_p)
@@ -86,7 +99,7 @@ def coarse_type(t: str | None) -> str:
     return 'Other'
 
 
-def load_jsonl(path: Path) -> dict:
+def load_jsonl(path: Path, active_keys: set[tuple[str, int]] | None = None) -> dict:
     """Return dict keyed by (task_ref, intervention_idx)."""
     out = {}
     if not path.exists():
@@ -100,6 +113,8 @@ def load_jsonl(path: Path) -> dict:
         if md.get('placeholder'):
             continue
         key = (str(r.get('task_ref')), r.get('intervention_idx'))
+        if active_keys is not None and key not in active_keys:
+            continue
         out[key] = {
             'a_score': md.get('a_score'),
             'b_score': md.get('b_score'),
@@ -107,6 +122,43 @@ def load_jsonl(path: Path) -> dict:
             'cancel_pass': md.get('cancel_pass'),
         }
     return out
+
+
+def load_active_keys(data_dir: Path, domain: str) -> set[tuple[str, int]]:
+    """Load active dataset cells so screened rows do not enter scoring."""
+    path = data_dir / f'{domain}_interventions.jsonl'
+    if not path.exists():
+        raise FileNotFoundError(f'dataset file not found: {path}')
+    keys = set()
+    for lineno, line in enumerate(path.open(), 1):
+        if not line.strip():
+            continue
+        row = json.loads(line)
+        if row.get('skip') or row.get('_skipped'):
+            continue
+        keys.add((str(row['base_task_id']), int(row['intervention_idx'])))
+    return keys
+
+
+def load_appworld_add_assertions(path: Path) -> dict[tuple[str, str, int], bool]:
+    """Load assertion-level AppWorld Add verdicts emitted by the replay scorer."""
+    if not path.exists():
+        raise FileNotFoundError(
+            f'AppWorld Add assertion verdicts not found: {path}\n'
+            'Run scripts/score_add_assertions.py before scripts/eval.py.'
+        )
+    verdicts = {}
+    for lineno, line in enumerate(path.open(), 1):
+        if not line.strip():
+            continue
+        row = json.loads(line)
+        if row.get('error'):
+            continue
+        key = (str(row['model']), str(row['task_ref']), int(row['intervention_idx']))
+        if key in verdicts:
+            raise ValueError(f'duplicate assertion verdict at {path}:{lineno}: {key}')
+        verdicts[key] = bool(row.get('assertion_pass'))
+    return verdicts
 
 
 def load_a_keyed_by_task(path: Path) -> dict:
@@ -126,18 +178,38 @@ def load_a_keyed_by_task(path: Path) -> dict:
     return out
 
 
-def compute_metrics(model_dir: Path, domain: str) -> dict | None:
+def compute_metrics(
+    model_dir: Path,
+    domain: str,
+    active_keys: set[tuple[str, int]],
+    appworld_add_assertions: dict[tuple[str, str, int], bool],
+) -> dict | None:
     """Compute SR + Adaptability for one (model, domain)."""
     A = load_a_keyed_by_task(model_dir / 'A_trajectories.jsonl')
-    B = load_jsonl(model_dir / 'B_trajectories.jsonl')
-    AB = load_jsonl(model_dir / 'AtoB_trajectories.jsonl')
+    B = load_jsonl(model_dir / 'B_trajectories.jsonl', active_keys)
+    AB = load_jsonl(model_dir / 'AtoB_trajectories.jsonl', active_keys)
     if not (B and AB):
         return None
 
     # Marginal SRs.
     sr_a = sum(1 for v in A.values() if (v.get('a_score') or 0) >= PASS) / max(len(A), 1) if A else None
     sr_b = sum(1 for v in B.values() if (v.get('b_score') or 0) >= PASS) / max(len(B), 1)
-    sr_ab = sum(1 for v in AB.values() if type_aware_pass(v['type'], v['a_score'], v['b_score'], v)) / max(len(AB), 1)
+    def passes(key, value):
+        assertion_verdict = appworld_add_assertions.get(
+            (model_dir.name, key[0], int(key[1]))
+        ) if domain == 'appworld' and coarse_type(value['type']) == 'Add' else None
+        return type_aware_pass(
+            value['type'], value['a_score'], value['b_score'], value,
+            domain=domain, appworld_add_pass=assertion_verdict,
+        )
+
+    non_cancel_ab = {
+        key: value for key, value in AB.items() if coarse_type(value['type']) != 'Cancel'
+    }
+    sr_ab = (
+        sum(1 for key, value in non_cancel_ab.items() if passes(key, value))
+        / max(len(non_cancel_ab), 1)
+    )
 
     # Restricted Adaptability: condition on vanilla B-pass.
     paired_keys = set(B.keys()) & set(AB.keys())
@@ -154,7 +226,7 @@ def compute_metrics(model_dir: Path, domain: str) -> dict | None:
         if (bd.get('b_score') or 0) >= PASS:
             n_b_pass += 1
             by_type[cls]['b_pass'] += 1
-            if type_aware_pass(abd['type'], abd['a_score'], abd['b_score'], abd):
+            if passes(k, abd):
                 n_both += 1
                 by_type[cls]['both'] += 1
 
@@ -185,7 +257,7 @@ def compute_metrics(model_dir: Path, domain: str) -> dict | None:
         'domain': domain,
         'n_A': len(A), 'SR_A': sr_a,
         'n_B': len(B), 'SR_B': sr_b,
-        'n_AB': len(AB), 'SR_AB': sr_ab,
+        'n_AB': len(non_cancel_ab), 'n_AB_with_cancel': len(AB), 'SR_AB': sr_ab,
         'n_paired': len(paired_keys), 'n_b_pass': n_b_pass, 'n_both': n_both,
         'Adapt_raw': adapt_raw,
         'Adapt_wilson': adapt_wilson,
@@ -196,15 +268,38 @@ def compute_metrics(model_dir: Path, domain: str) -> dict | None:
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument('--results', type=Path, default=Path('results'),
+    ap.add_argument('--results', type=Path, default=REPO_ROOT / 'results',
                     help='Directory containing <domain>/<model>/*.jsonl. Default: results/')
     ap.add_argument('--output', type=Path, default=None,
                     help='Optional path to write JSON summary.')
+    ap.add_argument('--data', type=Path, default=REPO_ROOT / 'data',
+                    help='Directory containing released intervention JSONL files. Default: data/')
+    ap.add_argument(
+        '--appworld-add-assertions', type=Path,
+        default=REPO_ROOT / 'results/_results/appworld_add_assertions.jsonl',
+        help='Assertion-level AppWorld Add JSONL from score_add_assertions.py.',
+    )
     args = ap.parse_args()
 
     if not args.results.exists():
         print(f"ERROR: results directory not found: {args.results}", file=sys.stderr)
         sys.exit(1)
+
+    domain_names = {
+        path.name for path in args.results.iterdir()
+        if path.is_dir() and path.name in ('appworld', 'webarena')
+    }
+    try:
+        active_by_domain = {
+            domain: load_active_keys(args.data, domain) for domain in domain_names
+        }
+        appworld_add_assertions = (
+            load_appworld_add_assertions(args.appworld_add_assertions)
+            if 'appworld' in domain_names else {}
+        )
+    except (FileNotFoundError, ValueError, json.JSONDecodeError) as exc:
+        print(f'ERROR: {exc}', file=sys.stderr)
+        sys.exit(2)
 
     rows = []
     for domain_dir in sorted(args.results.iterdir()):
@@ -216,7 +311,13 @@ def main():
         for model_dir in sorted(domain_dir.iterdir()):
             if not model_dir.is_dir():
                 continue
-            r = compute_metrics(model_dir, domain)
+            try:
+                r = compute_metrics(
+                    model_dir, domain, active_by_domain[domain], appworld_add_assertions
+                )
+            except ValueError as exc:
+                print(f'ERROR: {model_dir}: {exc}', file=sys.stderr)
+                sys.exit(2)
             if r is not None:
                 rows.append(r)
 
