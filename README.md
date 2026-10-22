@@ -1,9 +1,12 @@
+
 # InterventionBench
 
 **Can LLM Agents Adapt to Mid-task User Interventions?**
 *Findings of EMNLP 2026*
 
 Real users revise the goal while an agent is working: swap a target, add a request, drop a step, or cancel everything. **InterventionBench** measures how well LLM agents adapt when the goal changes mid-task, built on two stateful long-horizon environments: [AppWorld](https://github.com/StonyBrookNLP/appworld) and [WebArena](https://github.com/web-arena-x/webarena).
+
+<img width="614" height="342" alt="Screenshot 2026-10-22 at 11 33 12 PM" src="https://github.com/user-attachments/assets/a5e73f20-0cc7-48df-a85d-4100573951a3" />
 
 ## How it works
 
